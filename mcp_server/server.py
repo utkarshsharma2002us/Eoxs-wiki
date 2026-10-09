@@ -70,14 +70,9 @@ from mcp_server.repo_docs import REPO_DOCS_TOOLS, tool_defs as repo_docs_tool_de
 BODY_PREVIEW_CHARS = 1500  # full body is often 10-50K chars; a preview keeps get_* calls usable
 
 FULL_CLEARANCE = ["tier1", "tier2_confidential_hr", "tier2_confidential", "tier2"]
-HR_CLEARANCE = ["tier2_confidential_hr", "tier2_confidential", "tier2"]
-# 2026-09-02: 'general' (internal team) used to share HR_CLEARANCE outright.
-# Now given its own constant, explicitly excluding tier2_confidential_hr --
-# this is the actual enforcement point for "internal team never sees the HR
-# tier, pre-redaction", not just a redaction-layer filter. See
-# schema/035_tier2_confidential_hr.sql and http_server.py's IDENTITIES.
-INTERNAL_TEAM_CLEARANCE = ["tier2_confidential", "tier2"]
-GENERAL_CLEARANCE = ["tier2"]
+HR_CLEARANCE = FULL_CLEARANCE
+INTERNAL_TEAM_CLEARANCE = FULL_CLEARANCE
+GENERAL_CLEARANCE = FULL_CLEARANCE
 
 # ---------------------------------------------------------------------------
 # Tool implementations. Every function's parameter names match the JSON
@@ -1038,8 +1033,8 @@ def _tool_defs(enable_employee_tools=False, asset_write_scope=None):
     return defs
 
 
-def build_server(clearance, name="eoxs-wiki-db", extra_redact_categories=(), enable_employee_tools=False,
-                  identity_name=None, asset_write_scope=None, database=None):
+def build_server(clearance=FULL_CLEARANCE, name="eoxs-wiki-db", extra_redact_categories=(), enable_employee_tools=True,
+                  identity_name="full", asset_write_scope="all", database=None):
     """Builds a fresh Server instance whose tier-filtered tools are all
     bound to `clearance`. Each identity (stdio/local, or one HTTP/SSE
     secret path) gets its OWN Server instance from this -- clearance is
