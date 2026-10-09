@@ -51,6 +51,7 @@ new pages, wiki_ingestion/tier_classifier.py for the historical backlog).
 import asyncio
 import functools
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -370,7 +371,21 @@ def get_email(identifier, clearance=FULL_CLEARANCE):
     return thread
 
 
-def get_attachment_text(attachment_id, clearance=FULL_CLEARANCE):
+DEFAULT_ATTACHMENT_RETURN_CHARS = 50000  # bounds a single call's response, not what's stored --
+# ingestion/attachment_extract.py stores the complete extracted text unconditionally. A caller
+# that needs more than one default-sized page uses offset (generic) or sheet (xlsx-specific,
+# see the "--- sheet: X ---" markers _extract_xlsx writes) to get the rest, rather than the
+# whole file blowing out its own context in one call every time, on every attachment, regardless
+# of size. See the 2026-09-10 MAX_EXTRACT_CHARS incident this replaced for why storage-time
+# truncation is the wrong layer for this: it silently drops later sheets forever, unrecoverably,
+# rather than just requiring a second call to reach them.
+
+
+def _xlsx_sheet_names(text):
+    return re.findall(r"^--- sheet: (.*?) ---$", text, re.MULTILINE)
+
+
+def get_attachment_text(attachment_id, sheet="", offset=0, max_chars=DEFAULT_ATTACHMENT_RETURN_CHARS, clearance=FULL_CLEARANCE):
     """Returns the extracted text for one email attachment, by the 'id' from
     get_email's attachments list. Attachments have no access_tier column of
     their own -- enforced via a join to the parent thread's access_tier
@@ -378,7 +393,16 @@ def get_attachment_text(attachment_id, clearance=FULL_CLEARANCE):
     only ever reachable through a parent that already checks tier.
     extracted_text is NULL for formats extraction doesn't support (only pdf/
     docx/xlsx/csv are covered) -- callers should check get_email's
-    text_extracted flag first rather than assume every attachment has text."""
+    text_extracted flag first rather than assume every attachment has text.
+
+    sheet: for xlsx attachments, return just that one sheet's rows (exact
+    title match against the sheet tabs in the original file) instead of the
+    whole workbook -- the natural unit to ask for, and immune to offset math
+    landing mid-row. Ignored for non-xlsx formats.
+
+    offset/max_chars: generic pagination over the full extracted_text for
+    everything else (or for xlsx when no sheet is given) -- response notes
+    whether there's more and, if so, the offset to pass next."""
     row = db_query_one(
         """SELECT a.filename, a.mimetype, a.extracted_text
            FROM email_attachments a JOIN email_threads t ON t.id = a.thread_id
@@ -387,10 +411,35 @@ def get_attachment_text(attachment_id, clearance=FULL_CLEARANCE):
     )
     if not row:
         return {"error": f"no attachment matching id={attachment_id}"}
-    if row["extracted_text"] is None:
+    text = row["extracted_text"]
+    if text is None:
         return {"error": f"no extracted text available for attachment '{row['filename']}' "
                           "(unsupported format, or ingested before extraction was added)"}
-    return row
+
+    sheet_names = _xlsx_sheet_names(text)
+
+    if sheet:
+        m = re.search(
+            rf"^--- sheet: {re.escape(sheet)} ---$\n(.*?)(?=^--- sheet:|\Z)",
+            text, re.MULTILINE | re.DOTALL,
+        )
+        if not m:
+            return {"error": f"no sheet named {sheet!r} in this attachment",
+                    "available_sheets": sheet_names or None}
+        section = m.group(1)
+        return {"filename": row["filename"], "mimetype": row["mimetype"], "sheet": sheet,
+                "extracted_text": section, "total_chars": len(section)}
+
+    total_chars = len(text)
+    chunk = text[offset:offset + max_chars]
+    result = {"filename": row["filename"], "mimetype": row["mimetype"],
+              "extracted_text": chunk, "offset": offset, "total_chars": total_chars}
+    if offset + len(chunk) < total_chars:
+        result["truncated"] = True
+        result["next_offset"] = offset + len(chunk)
+    if sheet_names:
+        result["available_sheets"] = sheet_names
+    return result
 
 
 def list_calls(month="", date="", source="", clearance=FULL_CLEARANCE):
@@ -870,8 +919,19 @@ def _tool_defs(enable_employee_tools=False, asset_write_scope=None):
             name="get_attachment_text",
             description="Return the extracted text content of one email attachment, by the 'id' from get_email's "
                         "attachments list. Only pdf/docx/xlsx/csv attachments have extracted text -- check "
-                        "get_email's text_extracted flag on the attachment first.",
-            inputSchema={"type": "object", "properties": {"attachment_id": {"type": "string"}}, "required": ["attachment_id"]},
+                        "get_email's text_extracted flag on the attachment first. The full text is always "
+                        "stored, but one call returns at most 50000 characters by default -- for a large "
+                        "attachment, the response includes 'available_sheets' (xlsx workbooks) and/or "
+                        "'truncated'+'next_offset' (anything else) so you know there's more and how to get it. "
+                        "Pass 'sheet' with an exact tab name from 'available_sheets' to get just that sheet "
+                        "(xlsx only, preferred over offset math since it can't land mid-row); pass 'offset' "
+                        "(from a prior response's 'next_offset') to page through sequentially otherwise.",
+            inputSchema={"type": "object", "properties": {
+                "attachment_id": {"type": "string"},
+                "sheet": {"type": "string", "default": "", "description": "exact xlsx sheet tab name, from a prior response's available_sheets"},
+                "offset": {"type": "integer", "default": 0, "description": "character offset to resume from, from a prior response's next_offset"},
+                "max_chars": {"type": "integer", "default": 50000, "description": "max characters to return in this call"},
+            }, "required": ["attachment_id"]},
         ),
         Tool(
             name="list_calls",

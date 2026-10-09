@@ -105,6 +105,8 @@ https://5.223.44.95/mcp/<secret>/sse -- nginx passes /mcp/ through
 unchanged (no prefix stripping) for both secrets alike, see
 deploy/nginx-https.conf's single generic `location /mcp/` block.
 """
+import hashlib
+import logging
 import os
 import sys
 from pathlib import Path
@@ -112,12 +114,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
+import contextlib
+
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 from starlette.responses import Response
 
 from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+import psycopg2
 
 from mcp_server.server import build_server, FULL_CLEARANCE, HR_CLEARANCE, INTERNAL_TEAM_CLEARANCE, GENERAL_CLEARANCE
 
@@ -164,9 +171,21 @@ IDENTITIES = [
     # 7th element: database -- None (live, every real identity) or
     # "staging" (staging_qa only -- routes every tool call to
     # eoxs_wiki_staging, see mcp_server/db.py's use_database()).
-    ("full", os.environ["MCP_URL_SECRET"], FULL_CLEARANCE, (), True, "all", None),
-    ("ayan", os.environ["MCP_AYAN_URL_SECRET"], FULL_CLEARANCE, (), True, "all", None),  # 2026-08-21 apex: Ayan own write-capable identity (mirror of full; changed_by=ayan)
-    ("hr", os.environ["MCP_HR_URL_SECRET"], HR_CLEARANCE, ("non_payroll_monetary_amounts",), True, {SALARY_ASSET_SLUG}, None),
+    # 2026-09-03: moved off secret-in-the-URL, same pattern as 'general'/'hr'
+    # above. "raj" is now a fixed PUBLIC path segment naming who this identity
+    # is for -- clearance stays "full" internally (identity_name, used for
+    # build_server/tool naming/changed_by), only the URL and auth mechanism
+    # changed. Named by person rather than by clearance level ("full") because
+    # a separate "ayan" full-clearance identity exists on this same server;
+    # "/full/mcp" would not have distinguished the two.
+    # MCP_URL_SECRET is no longer read; its old URL now 404s.
+    ("full", "raj", FULL_CLEARANCE, (), True, "all", None, "raj"),
+    ("ayan", os.environ["MCP_AYAN_URL_SECRET"], FULL_CLEARANCE, (), True, "all", None, None),  # 2026-08-21 apex: Ayan own write-capable identity (mirror of full; changed_by=ayan)
+    # 2026-09-03: moved off secret-in-the-URL, same pattern as 'general' above.
+    # "hr" is now a fixed PUBLIC path segment; auth is a per-person token in an
+    # x-auth-token header against public.mcp_tokens (connector='hr').
+    # MCP_HR_URL_SECRET is no longer read; its old URL now 404s.
+    ("hr", "hr", HR_CLEARANCE, ("non_payroll_monetary_amounts",), True, {SALARY_ASSET_SLUG}, None, "hr"),
     # 2026-08-11: expanded from GENERAL_CLEARANCE (tier2 only) to
     # tier2_confidential + tier2 -- most tier2_confidential pages carry a
     # dollar figure alongside otherwise-relevant general content, and general
@@ -180,8 +199,20 @@ IDENTITIES = [
     # the pre-split tier2_confidential + tier2 list, deliberately excluding
     # the new HR-only tier. See schema/035_tier2_confidential_hr.sql and the
     # module docstring above.
-    ("general", os.environ["MCP_GENERAL_URL_SECRET"], INTERNAL_TEAM_CLEARANCE, ("monetary_amounts", "employee_activity_monitoring"), False, None, None),
-    ("intern", os.environ["MCP_INTERN_URL_SECRET"], GENERAL_CLEARANCE, ("monetary_amounts",), False, None, None),
+    # 2026-09-03: moved off secret-in-the-URL. "internal-team" is a fixed PUBLIC
+    # path segment, not a credential -- the URL is now the same for every person
+    # on the team. Auth is a per-person token in an x-auth-token header instead
+    # (8th element, header_auth_connector), checked against public.mcp_tokens
+    # in eoxs_frontend_threads. Revoking one person is one row update and
+    # touches nobody else's access or the URL itself -- the old secret required
+    # rotating the link (and re-onboarding everyone) to revoke anyone.
+    # MCP_GENERAL_URL_SECRET is no longer read; its old URL now 404s.
+    ("general", "internal-team", INTERNAL_TEAM_CLEARANCE, ("monetary_amounts", "employee_activity_monitoring"), False, None, None, "internal-team"),
+    # 2026-09-03: moved off secret-in-the-URL, same pattern as full/general/hr.
+    # "intern" is role-based (many interchangeable people fill it), so the
+    # public path matches the identity name, same convention as "hr".
+    # MCP_INTERN_URL_SECRET is no longer read; its old URL now 404s.
+    ("intern", "intern", GENERAL_CLEARANCE, ("monetary_amounts",), False, None, None, "intern"),
     # staging_qa: full clearance, every read tool, BOTH write tool sets
     # fully unrestricted (unlike hr's real-world restrictions -- there's
     # nothing to protect here, it's disposable test data) -- but database=
@@ -190,11 +221,57 @@ IDENTITIES = [
     # the 4 main skill files -- this identity is for direct hands-on QA by
     # whoever holds the secret, not for a persistent claude.ai connector
     # meant to answer real questions. See deploy/eoxs-wiki-db-skill-staging-qa.md.
-    ("staging_qa", os.environ["MCP_STAGING_URL_SECRET"], FULL_CLEARANCE, (), True, "all", "staging"),
+    ("staging_qa", os.environ["MCP_STAGING_URL_SECRET"], FULL_CLEARANCE, (), True, "all", "staging", None),
 ]
 
 
-def _make_routes(identity_name, secret, clearance, extra_redact_categories=(), enable_employee_tools=False, asset_write_scope=None, database=None):
+_STREAMABLE_MANAGERS = []
+
+
+logger = logging.getLogger("eoxs_mcp.http_server")
+
+
+def _resolve_header_token(headers, connector):
+    """Authorization/x-auth-token header -> username, for identities migrated
+    off secret-in-the-URL (currently just 'general' / internal-team).
+
+    Reads public.mcp_tokens in eoxs_frontend_threads -- a DIFFERENT database
+    from this server's own (OV2, on the DigitalOcean cluster) -- over the
+    local unix socket as `deploy`, which holds SELECT only. That keeps this
+    lookup read-only even though it lives in a write-capable process: a bug
+    here can confirm or deny a token, never mint or revoke one.
+
+    Only the SHA-256 is ever compared; the raw token is never stored anywhere,
+    including in this process's memory beyond the single request.
+    """
+    bearer = headers.get("authorization") or headers.get("x-auth-token")
+    if not bearer:
+        return None
+    tok = bearer.split(None, 1)[1].strip() if bearer.lower().startswith("bearer ") else bearer.strip()
+    if not tok:
+        return None
+    digest = hashlib.sha256(tok.encode()).hexdigest()
+    # Every parameter pinned explicitly, INCLUDING port. This process's own
+    # .env sets PGPORT=25060 for its OV2 database on the DigitalOcean cluster,
+    # and psycopg2 reads unset libpq parameters from the environment -- host
+    # was pinned but port was not, so the connection silently tried the DO
+    # cluster's port against a local socket path and failed outright
+    # (".s.PGSQL.25060": No such file or directory). This is the identical
+    # class of bug that hit wiki_mcp's own connection helper earlier: an
+    # inherited PG* variable redirecting a connection that looked pinned.
+    conn = psycopg2.connect(host="/var/run/postgresql", port=5432,
+                            dbname="eoxs_frontend_threads", user="deploy")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT username FROM public.mcp_tokens
+                           WHERE token_sha256=%s AND active AND connector=%s""", (digest, connector))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else None
+
+
+def _make_routes(identity_name, secret, clearance, extra_redact_categories=(), enable_employee_tools=False, asset_write_scope=None, database=None, header_auth_connector=None):
     mcp_server_instance = build_server(
         clearance, name=f"eoxs-wiki-db-{identity_name}", extra_redact_categories=extra_redact_categories,
         enable_employee_tools=enable_employee_tools, identity_name=identity_name, asset_write_scope=asset_write_scope,
@@ -213,16 +290,78 @@ def _make_routes(identity_name, secret, clearance, extra_redact_categories=(), e
         # the raw ASGI call underneath, so unpack the Request back into that shape.
         return await _handle_sse_raw(request.scope, request.receive, request._send)
 
-    return [
-        Route(f"{MOUNT_PREFIX}/{secret}/sse", endpoint=sse_endpoint, methods=["GET"]),
-        Mount(f"{MOUNT_PREFIX}/{secret}/messages/", app=sse.handle_post_message),
-    ]
+    # One dispatcher owning every method on this identity's mount, serving both
+    # MCP transports.
+    #
+    # The route above was GET-only, so a client probing with POST -- the
+    # Streamable HTTP handshake, which is what claude.ai tries first -- got 405
+    # Method Not Allowed from Starlette. A client cannot tell "wrong method"
+    # apart from "authenticate first" (401/403/405 all mean the request was not
+    # accepted as sent), so it reported the server as asking for sign-in. The
+    # probe only runs at registration, which is why logging out and back in
+    # appeared to fix it: the saved connector skipped the probe and went
+    # straight to the GET handshake that always worked.
+    #
+    # /mcp is now the canonical suffix; /sse is kept as an alias so every
+    # already-registered connector keeps working. Anything else 404s rather
+    # than falling through to the SSE branch and opening a stream for a stray
+    # request.
+    manager = StreamableHTTPSessionManager(app=mcp_server_instance, stateless=True)
+    _STREAMABLE_MANAGERS.append(manager)
+
+    async def dispatch(scope, receive, send):
+        # This Starlette hands a mounted app the FULL path and puts the matched
+        # prefix in root_path -- it does not strip the remainder for you.
+        raw = scope.get("path", "")
+        root = scope.get("root_path", "")
+        tail = (raw[len(root):] if root and raw.startswith(root) else raw).rstrip("/") or "/"
+
+        if header_auth_connector:
+            # secret is a fixed public label here (e.g. "internal-team"), not a
+            # credential -- the URL is the same for everyone. Auth is a per-
+            # person token in a header instead, so one person's access can be
+            # revoked without touching the URL or anyone else's token.
+            headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+            user = _resolve_header_token(headers, header_auth_connector)
+            if not user:
+                # No WWW-Authenticate: that header advertises RFC 6750 bearer
+                # auth (the OAuth family) and made claude.ai auto-select
+                # "Always required (Detected)", which then tries an OAuth flow
+                # this server does not implement. State plainly what is wanted
+                # instead of a header a client will misinterpret.
+                return await JSONResponse(
+                    {"error": "unauthorized",
+                     "detail": "This connector uses a static token, not OAuth. Set "
+                               "Authentication to None and add a request header "
+                               "'x-auth-token' with the token an admin minted for you."},
+                    status_code=401)(scope, receive, send)
+            logger.info("auth ok identity=%s user=%s path=%s method=%s",
+                        identity_name, user, tail, scope.get("method"))
+
+        if tail.startswith("/messages"):
+            await sse.handle_post_message(scope, receive, send)
+        elif tail not in ("/mcp", "/sse"):
+            await JSONResponse({"error": "not found", "hint": "use /mcp"},
+                               status_code=404)(scope, receive, send)
+        elif scope["method"] == "GET":
+            await _handle_sse_raw(scope, receive, send)
+        else:
+            await manager.handle_request(scope, receive, send)
+
+    # Header-auth identities (the new pattern) get a clean top-level path --
+    # /internal-team/mcp, not /mcp/internal-team/mcp -- since `secret` is now a
+    # readable label, not an opaque credential that needed hiding under the
+    # shared prefix. Secret-in-path identities keep MOUNT_PREFIX unchanged;
+    # nginx has a matching top-level location block per header-auth identity
+    # (currently just /internal-team/), proxying to the same backend.
+    mount_path = f"/{secret}" if header_auth_connector else f"{MOUNT_PREFIX}/{secret}"
+    return [Mount(mount_path, app=dispatch)]
 
 
 routes = [
     route
-    for identity_name, secret, clearance, extra, enable_employee_tools, asset_write_scope, database in IDENTITIES
-    for route in _make_routes(identity_name, secret, clearance, extra, enable_employee_tools, asset_write_scope, database)
+    for identity_name, secret, clearance, extra, enable_employee_tools, asset_write_scope, database, header_auth_connector in IDENTITIES
+    for route in _make_routes(identity_name, secret, clearance, extra, enable_employee_tools, asset_write_scope, database, header_auth_connector)
 ]
 
 # Unauthenticated liveness probe. Deliberately reveals nothing: no identity
@@ -256,7 +395,16 @@ async def health(request):
 
 routes.append(Route("/health", endpoint=health, methods=["GET"]))
 
-app = Starlette(routes=routes)
+@contextlib.asynccontextmanager
+async def _lifespan(app):
+    """StreamableHTTPSessionManager.handle_request needs its task group live."""
+    async with contextlib.AsyncExitStack() as stack:
+        for _m in _STREAMABLE_MANAGERS:
+            await stack.enter_async_context(_m.run())
+        yield
+
+
+app = Starlette(routes=routes, lifespan=_lifespan)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: eoxs-wiki-mcp
+    runtime: python
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "python -m mcp_server.http_server"
+    healthCheckPath: /health
+    envVars:
+      - key: MCP_MOUNT_PREFIX
+        value: "none"
+      - key: MCP_PUBLIC_PREFIX
+        value: ""
+      - key: PGHOST
+        sync: false
+      - key: PGPORT
+        value: "5432"
+      - key: PGDATABASE
+        value: "eoxs_wiki"
+      - key: PGUSER
+        sync: false
+      - key: PGPASSWORD
+        sync: false
+      - key: PGSSLMODE
+        value: "require"
+      - key: ANTHROPIC_API_KEY
+        sync: false

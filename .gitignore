@@ -9,3 +9,4 @@ bin/
 .env.*.bak
 *.bak.*
 logs/
+.claude/
