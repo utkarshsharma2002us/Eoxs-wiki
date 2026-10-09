@@ -13,11 +13,12 @@ SCHEMA_DIR = Path(__file__).resolve().parent
 
 def get_conn():
     return psycopg2.connect(
-        host=os.environ["PGHOST"],
-        port=os.environ["PGPORT"],
-        dbname=os.environ["PGDATABASE"],
-        user=os.environ["PGUSER"],
-        password=os.environ["PGPASSWORD"],
+        host=os.environ.get("PGHOST", "eoxs-db-live-cluster-do-user-42137371-0.d.db.ondigitalocean.com"),
+        port=os.environ.get("PGPORT", "25060"),
+        dbname=os.environ.get("PGDATABASE", "eoxs_wiki"),
+        user=os.environ.get("PGUSER", "eoxs_app"),
+        password=os.environ.get("PGPASSWORD", "Eoxs6333_kronox_db"),
+        sslmode=os.environ.get("PGSSLMODE", "require"),
     )
 
 def main():

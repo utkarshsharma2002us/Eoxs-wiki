@@ -44,21 +44,16 @@ def use_database(name):
 
 
 def get_conn():
-    dbname = os.environ["PGDATABASE"]
+    dbname = os.environ.get("PGDATABASE", "eoxs_wiki")
     if _target_database.get() == "staging":
         dbname = STAGING_DB
     return psycopg2.connect(
-        host=os.environ["PGHOST"],
-        port=os.environ["PGPORT"],
+        host=os.environ.get("PGHOST", "eoxs-db-live-cluster-do-user-42137371-0.d.db.ondigitalocean.com"),
+        port=os.environ.get("PGPORT", "25060"),
         dbname=dbname,
-        user=os.environ["PGUSER"],
-        password=os.environ["PGPASSWORD"],
-        # DigitalOcean Managed Postgres REQUIRES TLS and refuses a plaintext
-        # connection outright. Default "prefer" keeps a local socket/loopback
-        # connection working unchanged (it simply negotiates without TLS), so
-        # this is safe on the droplet and required off it -- set PGSSLMODE=require
-        # in the managed-database environment.
-        sslmode=os.environ.get("PGSSLMODE", "prefer"),
+        user=os.environ.get("PGUSER", "eoxs_app"),
+        password=os.environ.get("PGPASSWORD", "Eoxs6333_kronox_db"),
+        sslmode=os.environ.get("PGSSLMODE", "require"),
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
 
